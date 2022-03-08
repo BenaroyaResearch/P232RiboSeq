@@ -1,0 +1,1144 @@
+---
+title: "P232 Ribo Seq"
+author: "Analyst: Alex Hu"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+Project Summary
+------
+
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(mongolite)
+library(bRi)
+
+
+libs <- getProjectLibs("232-2", searchType = "regex")
+anno <- getAnno(libs)
+rownames(anno) <- anno$libid
+
+counts <- t(getGeneCounts(libs))
+
+library(grid)
+library(knitr)
+library(dplyr)
+library(ICC)
+library(circlize)
+library(ggplot2);theme_set(theme_bw(20) + theme(panel.grid.major = element_blank(),
+                                panel.grid.minor = element_blank(),
+                                panel.border = element_rect(colour="black", fill=NA, size=1),
+                                axis.text=element_text(colour="black"),
+                                axis.ticks=element_line(colour="black"))+
+  theme(legend.key = element_blank()))
+
+library(edgeR)
+library(limma)
+library(gplots)
+library(RColorBrewer) 
+library(ggthemes)
+library(ggbeeswarm)
+library(viridis)
+library(stringr)
+library(readxl)
+library(heatmap3)
+#library(ggforce)
+#Load Matt's library which includes a function for making barcode plots
+library(geneSetTools)
+library(scran)
+
+datadir = "../../data/2020-04-27/"
+plotdir = paste0(datadir,"plots/")
+source("/Users/ahu/Projects/bap/rnaseq/lib/CalcPCCors.R")
+source("/Users/ahu/Projects/bap/rnaseq/lib/plotGenerators.R")
+
+write.table(counts,paste0(datadir,"P232.3_counts.txt"),quote=FALSE,sep="\t",col.names=NA)
+write.table(anno,paste0(datadir,"P232.3_anno.txt"),quote=FALSE,sep="\t",col.names=NA)
+
+
+options(stringsAsFactors = FALSE)
+```
+
+```{r loading}
+
+
+metrics <- getMetrics(libs)
+
+design <- metrics
+design$libId <- str_extract(design$libid_fcid, "lib[0-9]+")
+rownames(design) <- design$libId
+colnames(counts)[1:ncol(counts)] <- str_extract(colnames(counts)[1:ncol(counts)], "lib[0-9]+")
+design <- merge(design, anno, by.x = "libId", by.y="row.names")
+rownames(design) <- design$libId
+design$cdr <- colSums(counts>1)[rownames(design)]
+
+parseSampleName <- function(sn){
+  id <- strsplit( strsplit(sn,"-")[[1]][2], "_")[[1]][1]
+  sn <- gsub("-[1-9]","",sn)  
+  tokens <- strsplit(sn,"_")[[1]]
+  tokens[1] <- id
+  if( length(tokens) == 3 ){
+    tokens <- c(tokens[1],tokens[2], "none", tokens[3])
+  }
+  names(tokens) <- c("id","stim","treatment","fraction")
+  return(tokens)
+}
+sampleinfo <- data.frame(t(sapply( design$sample_name, parseSampleName )))
+
+
+design[, colnames(sampleinfo)] <- sampleinfo
+```
+
+```{r set_up_qc_parameters, fig.width=4, fig.height=3}
+#Set QC cuts
+align_cut = 75
+total_reads_cut = 1
+median_cv_cut = 0.55
+
+#Get a colorblind palette
+cb_pal <- colorblind_pal()(8)
+cb_pal <- cb_pal[2:8]
+```
+
+RNA-seq Quality Metrics
+------
+
+In performing quality control, the following three metrics are examined:
+
+1. The total number of reads in each library (libraries with less than 1 million reads are suspect for bulk). For single cell, we expect: ????   
+2. The percent alignment of each library (higher is better)   
+3. Median CV coverage. This is the the median coefficient of variation of coverage of the 1000 most highly expressed transcripts. It measures read bias along the transcript. Ideally, this value would be 0.
+
+A histogram plotting the number of reads in P143 libraries is follows. The target number of reads for a bulk library is ~5 million. Many of these libraries have fewer than 1 million reads, which is unfortunate and may be too small to analyze properly. 
+
+```{r qcplots_total_reads, fig.width=4, fig.height=3}
+
+ggplot( design, aes(fastq_total_reads, fill=stim)) + geom_histogram() 
+design <- design[ rev(order(design$fastq_total_reads)),]
+
+png(paste(plotdir,"numreads.png",sep=""), height = 400, width = 1100)
+ggplot( design, aes(x=1:nrow(design),y=fastq_total_reads, fill=fraction)) + geom_bar(stat="identity") + labs(x="")
+dev.off()
+
+png(paste(plotdir,"QC_coverage_vs_alignment.png",sep=""), height = 400, width = 700)
+ggplot(design, aes(x=median_cv_coverage, y=pct_aligned, color = sort)) + geom_point(size=1.5) + labs(y = "percent alignment", x="Median CV Coverage") + geom_vline( xintercept = median_cv_cut) + geom_hline(yintercept = align_cut)
+invisible(dev.off())
+
+```
+
+The following plots compare the median CV of coverage and the percent alignment of reads in each library. High quality libraries will fall in the upper left quadrant of the box (high percent alignment and low median CV coverage). 
+
+There is a large number of low-quality samples defined by low percent alignment and high median cv coverage, and most of these samples come from patient 31. However, there is a cluster of patient 33 cells that also have high median cv coverage and low percent alignment. Plotting the same libraries with total reads on the Y-axis shows that the patient 33 cells with low alignment are the same cells that have very low read counts.
+
+
+```{r make_qc_cuts}
+design$qc_pass <- design$fastq_total_reads > total_reads_cut &
+                  design$pct_aligned > align_cut &
+                  design$median_cv_coverage < median_cv_cut
+                  
+
+design_qc <- design %>% dplyr::filter(qc_pass ==TRUE)
+rownames(design_qc) <- design_qc$libId
+counts_qc <- counts[,colnames(counts) %in% design_qc$libId]
+
+```
+
+```{r geneFiltering}
+#Get protein coding genes with HGNC symbols
+gene_key <- read.table("../../../data/ensemblkey_GRCm38.txt", header = TRUE,sep = "\t",na.strings = "") 
+genes_mgi <- gene_key[!is.na(gene_key$mgi_symbol),]
+
+nd <- !duplicated(genes_mgi$ensembl_gene_id)
+ens2mgi <- genes_mgi[nd, "mgi_symbol"]
+names(ens2mgi) <- genes_mgi[ nd, "ensembl_gene_id"]
+
+counts_mgi <- counts_qc[rownames(counts_qc) %in% genes_mgi$ensembl_gene_id,]
+genes_pc <- subset(genes_mgi, genes_mgi$gene_biotype == "protein_coding") #21119
+genes_pc <- genes_pc[!duplicated(genes_pc$ensembl_gene_id),] #remove duplicated ensembl genes #21117
+counts_pc <- merge(genes_pc, counts_qc, by.x="ensembl_gene_id", by.y ="row.names")
+gene_key_pc <- counts_pc[,1:4] #First three columns contain annotation information
+counts_pc <- counts_pc[,5:ncol(counts_pc),] #The remaining columns contain counts information \
+rownames(counts_pc) <- gene_key_pc[,1]
+
+#Define a function to filter out lowly expressed genes
+gene_filter <- function(counts_in, per_cutoff){
+  #Keep genes with cpm of at least one in at least per_cutoff fraction of libraries
+  #CPM normalize
+  counts_cpm_norm <- as.data.frame(t(t(counts_in*10^6)/colSums(counts_in)))
+  
+  #Filter out lowly expressed genes
+  keepRows <- rowSums((counts_cpm_norm) >= 1) >= per_cutoff*ncol(counts_cpm_norm)
+  counts_filtered <- counts_in[keepRows,]
+  
+  return(counts_filtered)
+  
+}
+
+#Run function to filter lowly expressed genes
+counts_all_filtered <- gene_filter(counts_mgi, 0.20)
+counts_pc_filtered <- gene_filter(counts_pc, 0.20)
+
+library(EDASeq)
+glens <- data.frame(getGeneLengthAndGCContent(rownames(counts_pc_filtered), "mm10", mode="org.db"))
+glens <- glens[ !is.na(glens$length),]
+normalize_counts <- function(counts_in, method){
+  #normalize using tmm or deconvolution
+  #tmm is good for bulk RNAseq
+  #deconvolution is best for large datasets of single cell RNAseq
+  #deconvolution is NOT recommended for smaller datasets (less than a few hundred cells)
+  
+  if(method == "decon"){
+  #Normalize using the deconvolution algorithm
+  decon_norm_factors <- computeSumFactors(as.matrix(counts_in))
+  counts_norm <- as.data.frame(t(t(counts_in)/decon_norm_factors))
+  }
+  
+  if(method == "tmm"){
+  #Normalize using the TMM algorithm 
+  dge <- DGEList(counts_in)
+  dge <- calcNormFactors(dge)
+  counts_norm <- edgeR::cpm(dge, normalized.lib.sizes=TRUE)
+  }
+  
+    if( method=="tpm"){
+      g <- rownames(glens)[ rownames(glens) %in% rownames(counts_in)]
+      tpm <- counts_in[g,]
+      for( i in 1:ncol(tpm) ){
+        tpm[,i] = tpm[,i]/glens$length
+      }
+      scaling <- colSums(tpm)/1000000 # per million scaling factor
+      for( i in 1:ncol(tpm) ){
+        tpm[,i] = tpm[,i]/scaling[i]
+      }
+      counts_norm <- tpm
+    }
+  
+  return(counts_norm)
+  
+}
+
+tpm_pc <- normalize_counts(counts_pc_filtered, "tpm")
+
+counts_pc_norm <- normalize_counts(counts_pc_filtered, "tmm")
+counts_all_norm <- normalize_counts(counts_all_filtered, "tmm")
+
+# Create a dataframe of gene names to attach to the DGEList(). Keep both ensembl_gene_id, and hgnc_symbol
+fgenes  <- genes_pc[match(rownames(counts_pc_norm ), genes_pc$ensembl_gene_id), c("ensembl_gene_id", "mgi_symbol")]
+dge <- DGEList(counts=counts_pc_norm, genes=fgenes)
+
+```
+
+Gene Filtering
+------
+A filter is applied to keep only genes with HGNC symbols that have been annotated as protein coding. This keeps `r nrow(genes_pc)` of 64345 genes. A second filter that selects genes with a count of at least one in 10% of libraries is also applied. This keeps `r nrow(counts_pc_filtered)` of the `r nrow(genes_pc)` genes from the first filter. The selected genes are normalized using the TMM (trimmed mean of M values) algorithm.
+
+
+Principal Component Analysis
+------
+Principal component analysis (PCA) looks for broad trends in gene expression across libraries in an unsupervised manner. There is no obviously apparent structure in PCA space, and the amount of variation described by the first two principal components is low, suggesting that there may be no single major overwhelming source of variation (like a batch effect) in the data. 
+
+```{r ribo stim v rest}
+
+library(reshape2)
+
+### DO ribo stim vs rest and also volcano plot for difference ribo / total.
+
+design$mouseid <- sapply( design$sample_name, function(s) strsplit(s,"_")[[1]][3])
+libids <- dcast(design[,c("libId","description","mouseid")], mouseid ~ description,  value.var="libId" )
+
+#Extended Figure 3D.
+#1) 
+#X-axis should be: (Ctrl CD4 Teff stimulated total RNA input) - (CD4 Teff IL7 rested total RNA input)
+#Y-axis should be: (Ctrl CD4 Teff stimulated Ribo_IP) - (CD4 Teff IL7 rested Ribo_IP)
+#2) 
+#X-axis should be: (CD4 Teff stimulated with Tregs total RNA input) - (CD4 Teff stimulated total RNA input)
+#Y-axis should be: (CD4 Teff stimulated with Tregs Ribo_IP) - (CD4 Teff stimulated Ribo_IP)
+
+#So, the 
+#RiboTag CD4 Teff IL7 rested O/N samples
+#RiboTag CD4 Teff stimulated 36h (Samples #3-5)
+#RiboTag CD4 Teff stimulated with Tregs (Samples #3-5) 
+total_stim_rest_ratio <- log2( (counts_pc_norm[, libids$`RiboTag CD4 Teff stimulated 36h total RNA input`]+1) / (counts_pc_norm[, libids$`RiboTag CD4 Teff IL7 rested O/N total RNA input`]+1))
+riboip_stim_rest_ratio <- log2( (counts_pc_norm[, libids$`RiboTag CD4 Teff stimulated 36h Ribo_IP`]+1) / (counts_pc_norm[, libids$`RiboTag CD4 Teff IL7 rested O/N Ribo_IP`]+1))
+df <- data.frame( totalRNA = rowMeans( total_stim_rest_ratio), riboIP = rowMeans(riboip_stim_rest_ratio))
+ggplot( df, aes(x=totalRNA,y=riboIP)) + geom_point()
+
+### Use LIMMA to get the log fold changes
+riboiplibs <- design$libId[ design$description %in% c("RiboTag CD4 Teff stimulated 36h Ribo_IP","RiboTag CD4 Teff IL7 rested O/N Ribo_IP","RiboTag CD4 Teff stimulated with Tregs Ribo_IP")]
+totallibs <- design$libId[ design$description %in% c("RiboTag CD4 Teff stimulated 36h total RNA input","RiboTag CD4 Teff IL7 rested O/N total RNA input", "RiboTag CD4 Teff stimulated with Tregs total RNA input")]
+
+
+clean_colnames <- function( cnames ){
+  cnames <- gsub( "design_limma\\$Cell.Type","",cnames)
+  cnames <- gsub( "design_limma\\$Study.Group","",cnames)
+  cnames <- gsub( " ",".",cnames)
+  cnames <- gsub( "\\+","p",cnames)
+  cnames <- gsub( "\\-","n",cnames)
+  return(cnames)
+}
+
+# Riboip: Get LIMMA DE genes between stim and nonstim, 
+design_riboip <- design[ riboiplibs,]
+design_riboip$description <- relevel( as.factor(design_riboip$description), "RiboTag CD4 Teff stimulated 36h Ribo_IP") # the stimulated is the base factor
+design_mat_riboip <- model.matrix(~ design_riboip$description + design_riboip$mouseid  )
+vwts_riboip<- voomWithQualityWeights(counts_pc_norm[,riboiplibs], design= design_mat_riboip, plot=T, span=0.1)
+vfit_riboip <- lmFit(vwts_riboip, design = design_mat_riboip)
+vfit_eb_riboip <- eBayes(vfit_riboip)
+
+# TotalRNA: Get LIMMA DE genes between stim and nonstim
+design_total <- design[ totallibs,]
+design_total$description <- relevel( as.factor(design_total$description), "RiboTag CD4 Teff stimulated 36h total RNA input")
+design_mat_total <- model.matrix(~ design_total$description + design_total$mouseid  )
+vwts_total<- voomWithQualityWeights(counts_pc_norm[,totallibs], design= design_mat_total, plot=T, span=0.1)
+vfit_total <- lmFit(vwts_total, design = design_mat_total)
+vfit_eb_total <- eBayes(vfit_total)
+DEtotal <- topTable (vfit_eb_total, coef = 2, number=Inf, sort.by="P")
+
+comparisons <- list()
+comparisons[["rest vs. stim riboip"]] <- topTable (vfit_eb_riboip, coef = 2, number=Inf, sort.by="P")
+comparisons[["rest vs. stim total"]] <- topTable (vfit_eb_total, coef = 2, number=Inf, sort.by="P")
+comparisons[["treg vs. stim riboip"]] <- topTable (vfit_eb_riboip, coef = 3, number=Inf, sort.by="P")
+comparisons[["treg vs. stim total"]] <- topTable (vfit_eb_total, coef = 3, number=Inf, sort.by="P")
+
+for( comp in names(comparisons)){
+  print(comp)
+  print( sum(comparisons[[comp]]$adj.P.Val <= 0.05))
+}
+
+fdrthresh <- 0.05
+genes <- rownames(comparisons[[1]])
+stimsigs <-unique( c( genes[ comparisons[["rest vs. stim riboip"]][genes,"adj.P.Val"] <= fdrthresh ], genes[ comparisons[["rest vs. stim total"]]$adj.P.Val <= fdrthresh ] ))
+tregsigs <- unique( c( genes[ comparisons[["treg vs. stim riboip"]][genes,"adj.P.Val"] <= fdrthresh ], genes[ comparisons[["treg vs. stim total"]]$adj.P.Val <= fdrthresh ] ))
+
+# The negative is because the base factor is stim 
+logFCs <- data.frame( stim_riboip = -comparisons[["rest vs. stim riboip"]][genes,"logFC"], stim_total = -comparisons[["rest vs. stim total"]][genes,"logFC"], treg_riboip = comparisons[["treg vs. stim riboip"]][genes,"logFC"], treg_total = comparisons[["treg vs. stim total"]][genes,"logFC"]  )
+rownames(logFCs) <- genes
+
+stimplot <- ggplot( logFCs[ stimsigs,], aes(x=stim_total,y=stim_riboip)) + geom_point() + labs( title="expression log fold changes\nafter stimulation ", x="total RNA\nlog2 fold change", y="RiboIP\nlog2 fold change")
+tregplot <- ggplot( logFCs[ tregsigs,], aes(x=treg_total,y=treg_riboip)) + geom_point() + labs( title="expression log fold changes\nafter Treg exposure", x="total RNA\nlog2 fold change", y="RiboIP\nlog2 fold change")
+
+pushViewport(viewport(layout = grid.layout(1 , 2)))
+vplayout <- function(x, y) viewport(layout.pos.row = x, layout.pos.col = y)
+print(stimplot, vp = vplayout(1,1)) 
+print(tregplot, vp = vplayout(1,2))
+
+
+
+```
+
+```{r limma for riboip vs total}
+libs <- c(riboiplibs, totallibs)
+
+des <- design[libs,]
+des$mouseid <- paste0("m",des$mouseid)
+design_mat <- model.matrix(~0 + des$description + des$mouseid ) 
+
+clean_colnames <- function( cnames ){
+  cnames <- gsub( "des\\$description","",cnames)
+  cnames <- gsub( "des\\$mouseid","",cnames)
+  cnames <- gsub( "/",".",cnames)
+  cnames <- gsub( " ",".",cnames)
+  return(cnames)
+}
+colnames(design_mat) <- clean_colnames( colnames(design_mat) )
+
+cont.matrix <- makeContrasts(
+  IL7rest = RiboTag.CD4.Teff.IL7.rested.O.N.Ribo_IP-RiboTag.CD4.Teff.IL7.rested.O.N.total.RNA.input,
+  stim = RiboTag.CD4.Teff.stimulated.36h.Ribo_IP-RiboTag.CD4.Teff.stimulated.36h.total.RNA.input,
+  treg = RiboTag.CD4.Teff.stimulated.with.Tregs.Ribo_IP-RiboTag.CD4.Teff.stimulated.with.Tregs.total.RNA.input,
+levels=design_mat)
+
+vwts_noint<- voomWithQualityWeights( tpm_pc[,libs], design= design_mat, plot=T, span=0.1)
+vfit_noint <- lmFit(vwts_noint, design = design_mat)
+vfit_c <- contrasts.fit(vfit_noint, cont.matrix)
+vfit_c_eb <- eBayes(vfit_c)
+
+for( i in 1:ncol(cont.matrix) ){
+  compname <- colnames(cont.matrix)[i]
+  comparisons[[compname]] <- topTable (vfit_c_eb, coef = i, number=Inf, sort.by="P")
+  print(compname)
+  sigs <- comparisons[[compname]]$adj.P.Val <= 0.05
+  print(table(sigs))
+}
+
+
+
+# Histograms for differences between polysomal and sub-polysomal
+comps <- names(comparisons)
+comps <- comps[ !grepl("vs.",comps)]
+sigcols <- c("N.S."="grey","FDR <= 0.05"="red")
+for( comp in comps){
+  print(comp)
+  DE <- comparisons[[comp]]
+  DE$significant <- ifelse(DE$adj.P.Val <= 0.05, "FDR <= 0.05", "N.S.")
+  numsig <- sum(DE$significant == "FDR <= 0.05")
+  DE$significant <- relevel( as.factor(DE$significant),"N.S.")
+  p <- ggplot(DE,aes(x=logFC, color=significant)) + geom_histogram(binwidth=.1) + scale_color_manual(values=sigcols) + labs(y="gene count",x="log2 TPM\nRibo-IP / Input", color="", title=comp) + geom_vline(xintercept=0, linetype="dotted") + ylim(c(0,2000)) + xlim(c(-4,4))
+  png( paste0(plotdir, comp, "_tpm_hist.png"), width=500,height=300 )
+  print(p)
+  dev.off()
+}
+
+# Histograms for differences between polysomal and sub-polysomal
+# Here make it so that it's in density rather than count
+comps <- names(comparisons)
+comps <- comps[ !grepl("vs.",comps)]
+sigcols <- c("N.S."="grey","FDR <= 0.05"="red")
+for( comp in comps){
+  print(comp)
+  DE <- comparisons[[comp]]
+  DE$significant <- ifelse(DE$adj.P.Val <= 0.05, "FDR <= 0.05", "N.S.")
+  numsig <- sum(DE$significant == "FDR <= 0.05")
+  DE$significant <- relevel( as.factor(DE$significant),"N.S.")
+  p <- ggplot(DE,aes(x=logFC, color=significant, group=significant)) + geom_histogram(aes(y=..count../sum(..count..),group=significant),binwidth=.1, position="identity",alpha=0.2) + scale_color_manual(values=sigcols) + labs(y="gene count",x="log2 TPM\nRibo-IP / Input", color="", title=comp) + geom_vline(xintercept=0, linetype="dotted") + xlim(c(-4,4))
+  #png( paste0(plotdir, comp, "_tpm_hist_density.png"), width=500,height=300 )
+  print(p)
+  #dev.off()
+  break
+}
+aes(y=..count../sum(..count..))
+titletrans
+make_volcano <- function(de,title="",fc_cutoff=log2(1.5),p_cutoff =0.05 ){
+  de$mgi_symbol <- ens2mgi[ rownames(de)]
+  de$logPVal <- -log10( de$adj.P.Val)
+  
+  de$lfc <- rep("n.s.", nrow(de))
+  de$lfc[ de$logFC >= fc_cutoff & de$adj.P.Val <= p_cutoff ] <- "up"
+  de$lfc[ de$logFC <= -fc_cutoff & de$adj.P.Val <= p_cutoff ] <- "down"
+  print(table(de$lfc))
+  p <- ggplot(data = de, aes(x=logFC, y=logPVal, color = lfc)) + geom_point(alpha=0.7, size=1.5, shape = 19) + scale_color_manual(values = c("down"="orange", "up"="red","n.s."="grey"))+ ggtitle( title ) + theme(legend.position = "none") + labs( x = "log2 translation efficiency", y="-log10 FDR") + geom_vline(xintercept=fc_cutoff, color="black", linetype="dotted",size=1.0) + geom_vline(xintercept=-1*fc_cutoff, color="black", linetype="dotted",size=1.0)+
+geom_hline(yintercept=-log10(p_cutoff), color="black",linetype="dotted",size=1.0)+
+theme(text = element_text(size=16)) + geom_text_repel(data=de[de$adj.P.Val <= 10^-10,], aes(logFC, -log10(adj.P.Val), fontface="bold", label=mgi_symbol), size=4) + xlim(c(-5,5)) + ylim(c(0,20))
+  return(p)
+}
+
+p1 <- make_volcano(comparisons[["IL7rest"]], "IL7 rested cells")
+p2 <- make_volcano(comparisons[["stim"]], "Stimulated cells")
+p3 <- make_volcano(comparisons[["treg"]], "Stimulated cells + T-regs")
+
+pdf( paste0(plotdir,"TE_volcanos.pdf"),width=12,height=4.5)
+#png( paste0(plotdir,"TE_volcanos.png"),width=1000,height=350)
+pushViewport(viewport(layout = grid.layout(1 , 3)))
+vplayout <- function(x, y) viewport(layout.pos.row = x, layout.pos.col = y)
+print(p1, vp = vplayout(1,1)) 
+print(p2, vp = vplayout(1,2))
+print(p3, vp = vplayout(1,3))
+dev.off()
+```
+
+```{r pca, fig.width=4, fig.height=3}
+## Do DE comparisons between stim and non stim, in the ribo-ip and total
+
+
+
+
+pca = prcomp(log2(as.data.frame(t(counts_pc_norm))+1), center=TRUE, scale=FALSE)
+#Get PCA resutls and merge with sample information stored in metrics
+sum_pca = summary(pca)
+pca_scores= as.data.frame(pca$x)
+pdatscores <- merge(design_qc, pca_scores, by.x = "libId", by.y="row.names")
+
+de <- comparisons[["5*(sortCD4mDUMPmCD45RAmCD137pCRTH2p)-sortCD154pCD27mCRTH2p-sortCD154pCD27p-sortCD4pDUMPmCD45RAmCD154p-sortCD4pDUMPmCD45RAmCD154pCXCR5p-sortCD4pDUMPmCD45RAmCD154pST2p"]]
+de <- de[ order(de$P.Value.H),]
+print(de[1:50,c("HGNC.symbol","logOE","logFC","adj.P.Val.H")])
+
+pclabs <- sapply(1:6, function(i) paste("PC",i," (", round(100*sum_pca$importance[2, i], 1),  "%)", sep="") )
+
+pdatscores$g <- t(log2(counts_pc_norm["ENSG00000121966",pdatscores$libId]+1))
+cd4neggenes <- c("KRT1","CXCR4","IL16","KLRB1","PPARG","PTGS2","BCL6","CXCR6","IL21","IL4","IL5","IL9","IL13","HPGDS","GATA3")
+for( g in cd4neggenes ){
+  print(g)
+  ens <- rownames(de)[de$HGNC.symbol==g]
+  pdatscores$g <- t(log2(counts_pc_norm[ens,pdatscores$libId]+1))
+  if(TRUE){
+  png(paste(plotdir,g,"_pc1pc2_sort_stim_P323-2P323-3.png",sep=""), height = 400, width = 500)
+  p <- ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = g, shape=sort!="CD4-DUMP-CD45RA-CD137+CRTH2+"), size=2)+
+  labs(x = pclabs[1], y = pclabs[2], title=g, color="log\nexpression", shape="CD4")+
+  theme(text = element_text(size=12)) + scale_color_viridis() + scale_shape_manual(values=c("TRUE"=16,"FALSE"=12))
+  print(p)
+  dev.off()}
+  
+    png(paste(plotdir,g,"_boxplot_P323-2P323-3.png",sep=""), height = 300, width = 500)
+  p <- ggplot(data=pdatscores, aes(x=sort, y=g)) +
+  geom_boxplot() +  geom_point() + labs(x = "sort", y="log2\nexpression",title=g)+
+  theme(text = element_text(size=12)) + scale_color_viridis() + coord_flip()
+  print(p)
+  dev.off()
+  
+}
+
+
+ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = description), size=2)+
+  labs(x = pclabs[1], y = pclabs[2])+
+  theme(text = element_text(size=12))
+
+ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = cdr), size=2)+
+  labs(x = pclabs[1], y = pclabs[2])+
+  theme(text = element_text(size=12))
+
+ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=cdr, color = sort), size=2)+
+  labs(x =pclabs[1], y ="CDR")+
+  theme(text = element_text(size=12))
+
+sortcolors <- c("pink","gold","blue","green","black","orange")
+names(sortcolors) <- unique(design$sort)
+  
+
+stimcolors <- c("red","blue")
+names(stimcolors) <- unique(design$stimulation)
+
+textsize <- 14
+p1 <- ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = sort), size=2)+
+  labs(x = pclabs[1], y = pclabs[2])+ scale_color_manual(values=sortcolors) + 
+  theme(text = element_text(size=textsize))
+
+pdatsores$TCRDetected <- pdatscores$libId %in% pairs$libid
+ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = sort, shape=TCRDetected), size=3)+
+  labs(x = pclabs[1], y = pclabs[2])+ scale_color_manual(values=sortcolors) + 
+  theme(text = element_text(size=textsize)) + scale_shape_manual( values=c("FALSE"=4,"TRUE"=16))
+
+p2 <- ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = stimulation), size=2)+
+  labs(x = pclabs[1], y = pclabs[2])+
+  theme(text = element_text(size=textsize)) + scale_color_manual(values=stimcolors)
+
+p3 <- ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC3, y=PC4, color = sort), size=2)+
+  labs(x = pclabs[3], y = pclabs[4])+  scale_color_manual(values=sortcolors) +
+  theme(text = element_text(size=textsize))
+
+p4 <- ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC3, y=PC4, color = stimulation), size=2)+
+  labs(x = pclabs[3], y = pclabs[4])+
+  theme(text = element_text(size=textsize)) + scale_color_manual(values=stimcolors)
+
+
+p5 <- ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC5, y=PC6, color = sort), size=2)+
+  labs(x = pclabs[5], y = pclabs[6])+  scale_color_manual(values=sortcolors) +
+  theme(text = element_text(size=textsize))
+
+p6 <- ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC5, y=PC6, color = stimulation), size=2)+
+  labs(x = pclabs[5], y = pclabs[6])+
+  theme(text = element_text(size=textsize)) + scale_color_manual(values=stimcolors)
+
+
+png(paste(plotdir,"pc1topc6_sort_stim_P323-2P323-3.png",sep=""), height = 700, width = 1200)
+pushViewport(viewport(layout = grid.layout(3 , 2)))
+vplayout <- function(x, y) viewport(layout.pos.row = x, layout.pos.col = y)
+print(p1, vp = vplayout(1,1)) 
+print(p3, vp = vplayout(1,2))
+print(p5, vp = vplayout(2,1))
+print(p4, vp = vplayout(2,2))
+print(p5, vp = vplayout(3,1))
+print(p6, vp = vplayout(3,2))
+dev.off() 
+
+png(paste(plotdir,"pc1pc2_sort_stim_P323-2P323-3.png",sep=""), height = 350, width = 600)
+  print(p1)
+dev.off() 
+png(paste(plotdir,"pc3pc4_sort_stim_P323-2P323-3.png",sep=""), height = 350, width = 600)
+  print(p3)
+dev.off() 
+png(paste(plotdir,"pc5pc6_sort_stim_P323-2P323-3.png",sep=""), height = 350, width = 600)
+  print(p5)
+dev.off() 
+
+
+p5 <- ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC1, y=PC2, color = as.factor(Donor.ID)), size=2)+
+  labs(x = pc1_lab, y = pc2_lab)+
+  theme(text = element_text(size=12))
+
+p6 <- ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC3, y=PC4, color = as.factor(Donor.ID)), size=2)+
+  labs(x = pc3_lab, y = pc4_lab)+
+  theme(text = element_text(size=12))
+
+ggplot() + 
+  geom_point(data=pdatscores, aes(x=PC3, y=PC4, color = fastq_total_reads), size=2)+
+  labs(x = pc1_lab, y = pc2_lab)+
+  theme(text = element_text(size=12))
+
+png(paste(plotdir,"pc1topc4_donor_id.png",sep=""), height = 400, width = 900)
+pushViewport(viewport(layout = grid.layout(1 , 2)))
+vplayout <- function(x, y) viewport(layout.pos.row = x, layout.pos.col = y)
+print(p5, vp = vplayout(1,1)) 
+print(p6, vp = vplayout(1,2))
+dev.off() 
+
+```
+
+```{r expanded}
+
+tcrs$chain <- ifelse( grepl("TRB",tcrs$v_gene), "b", "a")
+pairedlibs <- intersect( tcrs[tcrs$chain=="a","libid"], tcrs[tcrs$chain=="b","libid"])
+pairedtcrs <- tcrs[tcrs$libid %in% pairedlibs,]
+
+chainspecific <- c("full_nt_sequence","v_gene","j_gene","junction")
+get_pairs <- function(libid){
+  libtcrs <- tcrs[ tcrs$libid==libid,]
+  a <- libtcrs[libtcrs$chain=="a", chainspecific]
+  b <- libtcrs[libtcrs$chain=="b", chainspecific]
+  generic <- libtcrs[1, ! colnames(libtcrs) %in% chainspecific & colnames(libtcrs) != "chain"]
+  
+  colnames(a) <- paste0( chainspecific, "_a")
+  colnames(b) <- paste0( chainspecific, "_b")
+  df <- c()
+  for( ai in 1:nrow(a)){
+    for(bi in 1:nrow(b)){
+      df <- rbind( df, cbind(a[ai,],b[bi,],generic))
+    }
+  }
+  return(df)
+}
+
+pairs <- do.call(rbind,lapply( unique(pairedtcrs$libid), get_pairs))
+pairs$subject
+
+pairtab <- table( paste(pairs$full_nt_sequence_a, pairs$full_nt_sequence_b))
+expandedpair <- names(pairtab)[ pairtab > 1]
+
+expandedlib <- pairs$libid[ paste(pairs$full_nt_sequence_a, pairs$full_nt_sequence_b) %in% expandedpair]
+
+pairs <- cbind(pairs, design[pairs$libid,] )
+write.table(pairs[ pairs$libid %in% expandedlib, c("libid","sort","junction_a","junction_b","stimulation")], paste0(datadir,"/expanded_libraries.txt"), quote=FALSE,row.names = FALSE, sep="\t")
+
+```
+
+```{r UMAP}
+library(umap)
+dat <- log2(as.data.frame(t(counts_pc_norm))+1)
+rownames(design) <- design$libId
+#pca = prcomp(log2(as.data.frame(t(counts_all_norm))+1), center=TRUE, scale=FALSE)
+uparams <- umap.defaults
+uparams$n_neighbors <- 50
+uparams$random_state <- 2
+#dat <- scale( log2(as.data.frame(t(counts_all_norm))+1) )
+
+u  <- umap(dat, config = uparams)
+#u  <- umap(dat, config = uparams)
+ul <- data.frame( u$layout )
+ul <- cbind(ul,design[rownames(ul),])
+ggplot(ul,aes(x=X1,y=X2,color=Cell.Type)) + geom_point()
+ggplot(ul,aes(x=X1,y=X2,color=Study.Group)) + geom_point()
+```
+
+
+
+```{r heatmap of stuff}
+library(ComplexHeatmap)
+
+make_colors <- function(values){
+  cb_pal <- colorblind_pal()(8)
+  numvals <- length(values)
+  my_cb_pal <- colorRampPalette(cb_pal)(numvals)
+  colorlist = c()
+  for( i in 1:numvals ){
+    colorlist[values[i]] <- my_cb_pal[i]
+  }
+  return(colorlist)
+}
+rownames(design) <- design$libId
+studycolors <- make_colors( unique(design$Study.Group))
+cellcolors <- make_colors( unique(design$Cell.Type))
+
+
+# Make an example heatmap
+rownames(design) <- design$libId
+DE <- comparisons[["ST2pvn.IL33.response"]]
+sigs <- DE$Ensembl.Gene.ID[ DE$adj.P.Val <= 0.05]
+sigs <- sigs[order(DE[sigs,"P.Value"])]
+libs <- colnames(counts_pc_norm)
+libs <- libs[ design[libs,"Cell.Type"] %in% c("ST2+ IL33","ST2-IL33","ST2+","ST2-")]
+libs <- libs[ order(design[libs,"Cell.Type"])]
+toplot <- t(scale(t(log2(counts_pc_norm[ sigs, libs ]+1))))
+toplot <- toplot[ !is.na(rowSums(toplot)),]
+ha = HeatmapAnnotation(data.frame(treatment=design_qc[libs,"Study.Group"],cell=design_qc[libs,"Cell.Type"]), col=list(treatment=studycolors,cell=cellcolors))
+rownames(toplot) <- comparisons[[1]][rownames(toplot),"HGNC.symbol"]
+Heatmap( toplot, top_annotation=ha, cluster_columns=FALSE, col = colorRamp2(c(-3, 0, 3), c("blue", "white", "red")), show_column_names=FALSE,name="scaled\nexpression")
+
+
+# Make an example heatmap
+rownames(design) <- design$libId
+DE <- comparisons[["ST2.IL33.pvn"]]
+sigs <- DE$Ensembl.Gene.ID[ DE$adj.P.Val <= 0.05]
+sigs <- sigs[order(DE[sigs,"P.Value"])][1:45]
+libs <- colnames(counts_pc_norm)
+libs <- libs[ design[libs,"Cell.Type"] %in% c("ST2+ IL33","ST2-IL33")]
+libs <- libs[ order(design[libs,"Cell.Type"])]
+toplot <- t(scale(t(log2(counts_pc_norm[ sigs, libs ]+1))))
+toplot <- toplot[ !is.na(rowSums(toplot)),]
+ha = HeatmapAnnotation(data.frame(treatment=design_qc[libs,"Study.Group"],cell=design_qc[libs,"Cell.Type"]), col=list(treatment=studycolors,cell=cellcolors))
+rownames(toplot) <- comparisons[[1]][rownames(toplot),"HGNC.symbol"]
+Heatmap( toplot, top_annotation=ha, cluster_columns=FALSE, col = colorRamp2(c(-3, 0, 3), c("blue", "white", "red")), show_column_names=FALSE,name="scaled\nexpression")
+
+DE <- comparisons[["CD27p.IL33"]]
+sigs <- DE$Ensembl.Gene.ID[ DE$adj.P.Val <= 0.05]
+libs <- colnames(counts_pc_norm)
+libs <- libs[ design[libs,"Cell.Type"] %in% c("CD27+","CD27+ IL33")]
+libs <- libs[ order(design[libs,"Cell.Type"])]
+toplot <- t(scale(t(log2(counts_pc_norm[ sigs, libs ]+1))))
+toplot <- toplot[ !is.na(rowSums(toplot)),]
+ha = HeatmapAnnotation(data.frame(treatment=design_qc[libs,"Study.Group"],cell=design_qc[libs,"Cell.Type"]), col=list(treatment=studycolors,cell=cellcolors))
+rownames(toplot) <- comparisons[[1]][rownames(toplot),"HGNC.symbol"]
+Heatmap( toplot, top_annotation=ha, cluster_columns=FALSE,name="scaled\nexpression",show_column_names=FALSE,show_row_names=FALSE, col = colorRamp2(c(-3, 0, 3), c("blue", "white", "red")))
+
+DE <- comparisons[["ILC.v.all"]]
+sigs <- DE$Ensembl.Gene.ID[ DE$adj.P.Val <= 0.05]
+#sigs <- toppc2
+libs <- colnames(counts_pc_norm)
+#libs <- libs[ design[libs,"Cell.Type"] %in% c("CD27+","CD27+ IL33")]
+libs <- libs[ order(design[libs,"Cell.Type"])]
+libs <- libs[ order(grepl("ILC2",design[libs,"Cell.Type"]))]
+toplot <- t(scale(t(log2(counts_pc_norm[ sigs, libs ]+1))))
+toplot <- toplot[ !is.na(rowSums(toplot)),]
+ha = HeatmapAnnotation(data.frame(treatment=design_qc[libs,"Study.Group"],cell=design_qc[libs,"Cell.Type"]), col=list(treatment=studycolors,cell=cellcolors))
+rownames(toplot) <- comparisons[[1]][rownames(toplot),"HGNC.symbol"]
+Heatmap( toplot, top_annotation=ha, cluster_columns=FALSE,name="scaled\nexpression",show_column_names=FALSE,show_row_names=TRUE, col = colorRamp2(c(-4, 0, 4), c("blue", "white", "red")))
+
+DE <- comparisons[["ILC.v.all"]]
+DE <- DE[order(DE$P.Value)]
+#sigs <- DE$Ensembl.Gene.ID[ DE$adj.P.Val <= 0.05]
+sigs <- rownames(DE)[1:40]
+libs <- colnames(counts_pc_norm)
+#libs <- libs[ design[libs,"Cell.Type"] %in% c("CD27+","CD27+ IL33")]
+libs <- libs[ order(design[libs,"Cell.Type"])]
+libs <- libs[ order(grepl("ILC2",design[libs,"Cell.Type"]))]
+toplot <- t(scale(t(log2(counts_pc_norm[ sigs, libs ]+1))))
+toplot <- toplot[ !is.na(rowSums(toplot)),]
+ha = HeatmapAnnotation(data.frame(treatment=design_qc[libs,"Study.Group"],cell=design_qc[libs,"Cell.Type"]), col=list(treatment=studycolors,cell=cellcolors))
+rownames(toplot) <- comparisons[[1]][rownames(toplot),"HGNC.symbol"]
+Heatmap( toplot, top_annotation=ha, cluster_columns=FALSE,name="scaled\nexpression",show_column_names=FALSE,show_row_names=FALSE, col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")) )
+
+tp <- cbind(t(toplot),design[colnames(toplot),])
+ggplot(tp,aes(x=grepl("ILC",Cell.Type),y=IL5)) + g
+```
+
+```{r VolcanoPlot}
+
+fc_cutoff <- 1
+p_cutoff <- 0.05
+DE <- comparisons[["DN.IL33"]]
+
+for( i in 1:ncol(cont.matrix) ){
+  compname <- colnames(cont.matrix)[i]
+  print(compname)
+  DE <- comparisons[[compname]] 
+  nsig <- min(50,sum(DE$adj.P.Val<=0.05))
+  png(paste0(plotdir,compname,"_volcano.png"),height=500,width=600)
+  p <- ggplot(data = DE, aes(x=logFC, y=-log10(adj.P.Val), color = logFC>0)) +
+geom_point(alpha=0.7, size=2.5, shape = 19) +
+scale_color_manual(values = c("orange", "red"))+
+labs(title=compname, x="log2 fold change",y="-log10 FDR") + 
+theme(legend.position = "none") +
+geom_vline(xintercept=fc_cutoff, color="black", linetype="dotted",size=1.0) +
+geom_vline(xintercept=-1*fc_cutoff, color="black", linetype="dotted",size=1.0)+
+geom_hline(yintercept=-log10(p_cutoff), color="black",linetype="dotted",size=1.0)+
+theme(text = element_text(size=16)) +  geom_text_repel(data=DE[1:nsig,], aes(logFC, -log10(adj.P.Val), fontface="bold", label=HGNC.symbol), size=4)
+  print(p)
+  dev.off()
+}
+
+g <- rownames(comparisons[[1]])
+logfctable <- data.frame( sapply( names(comparisons), function(x) comparisons[[x]][g,"logFC"]  ) )
+pvaltable <- data.frame( sapply( names(comparisons), function(x) comparisons[[x]][g,"adj.P.Val"]  ) )
+colnames(pvaltable) <- paste0( colnames(pvaltable), ".qval")
+results <- cbind(logfctable,pvaltable)
+
+
+ggplot(results,aes(x=ST2n.IL33, y=ST2p.IL33,color=ST2pvn.IL33.response.qval <= 0.05)) + geom_point()
+#png(paste(plotdir,"st2IL33_pvn_volcano.png",sep=""), height = 400, width = 600)
+
+#dev.off()
+
+```
+
+
+```{r GSEA}
+
+
+hallmark <- read.csv("../../../EoE2018/data/2018-08-27/gene_sets/hallmark.csv")
+#c7 <- read.csv("../../../EoE2018/data/2018-08-27/gene_sets/c7.csv")
+tfs <- read.table("~/Projects/data/GeneSets/TFTargets/TF_target_genesets_proteincoding.txt",header=TRUE,sep="\t")
+gene_key <- read.table("../../../data/ensemblkey_GRCh38.txt", header = TRUE,sep = "\t",na.strings = "") 
+
+#genesets <- list("hallmark"=hallmark,"c7"=c7,"cellsigs"=cellsigs)
+genesets <- list("hallmark"=hallmark,"TFs" = tfs)
+genesets <- list("hallmark"=hallmark,"TFs" = tfs)
+roasts <- list()
+for(contrast in names(comparisons) ){
+  for( i in 1:length(genesets) ){
+    comparison <- paste( contrast, names(genesets)[i], sep="_" )
+    print(comparison)
+    if(!comparison %in% names(roasts) ){
+      r<- roast(
+      y=vwts_noint,
+      index=ids2indices(genesets[[i]], identifiers=gene_key$HGNC.symbol[match(rownames(vwts_noint), gene_key$Ensembl.Gene.ID)]),
+      design=design_mat_noint,
+      contrast=cont.matrix[,contrast],
+      nrot = 8000)
+      roasts[[comparison]] <- r
+    }
+    else{
+      r <- roasts[[comparison]]
+    }
+    #print(table(r$FDR <= 0.05 | r$FDR.Mixed <= 0.05) )
+    sigsets <- rownames(r)[r$FDR <= 0.05]# | r$FDR.Mixed <= 0.05]
+    if(length(sigsets)>0 & names(genesets)[i] == "TFs"){print(length(sigsets));print( r[sigsets,])} else{
+      #print(head(r))
+    }
+    #print(table(r$FDR <= 0.05 | r$FDR.Mixed <= 0.05) )
+    if( length(sigsets) > 0 ){
+      #write.table( r, paste0(datadir,"GSEA/",comparison,".txt"),sep="\t",quote=FALSE)
+    }
+  }
+}
+
+
+```
+
+```{r goana gene annotation}
+
+ezkey <- read.table("../../../data/ensemblkey_GRCm38.txt", header = TRUE,sep = "\t",na.strings = "") 
+ens2entrez <- ezkey$entrezgene
+names(ens2entrez) <- ezkey$ensembl_gene_id
+
+tidy_bh_go <- function(go){
+  # For Goana output
+  if("Term" %in% colnames(go) ){
+    up <- go[,c("Term","Ont","N","Up","P.Up")]
+    down <- go[,c("Term","Ont","N","Down","P.Down")]
+    colnames(down) <- c("Term","Ont","N","N Genes Changed","PValue")
+    colnames(up) <- c("Term","Ont","N","N Genes Changed","PValue")
+  }
+  # For Kegga output
+  else{
+    up <- go[,c("Pathway","N","Up","P.Up")]
+    down <- go[,c("Pathway","N","Down","P.Down")]
+    colnames(down) <- c("Pathway","N","N Genes Changed","PValue")
+    colnames(up) <- c("Pathway","N","N Genes Changed","PValue")
+  }
+  down$direction <- rep("Down",nrow(down))
+  up$direction <- rep("Up",nrow(down))
+  go <- rbind(up,down)
+  go$QValue <- p.adjust(go$PValue,method="BH")
+  go <- go[order(go$PValue),]
+  return(go)    
+}
+
+getKeggsGos <- function(vfit, coeffs=c()){
+    
+  if( length(coeffs) == 0 ){
+    coeffs <- colnames(vfit)
+  }
+  gokegga <- list()
+  for( coeff in coeffs[ coeffs != "(Intercept)"] ){
+  
+    i <- which(coeff == coeffs)
+    print(coeff)
+    goname <- paste0("goana_",coeff)
+    if( ! goname %in% names(gokegga) ){
+      go <- goana(vfit,coef=i, geneid=as.character(ens2entrez[rownames(vfit)]),FDR=0.05, species="Mm")
+      go <- tidy_bh_go(go)
+      gokegga[[paste0("goana_",coeff)]] <-go 
+    }
+    else{
+      go <- gokegga[[paste0("goana_",coeff)]]
+    }
+    print("go")
+    print( table(go$QValue <= 0.05) )
+    
+    keggname <- paste0("kegga_",coeff)
+    if( ! keggname %in% names(gokegga) ){
+      kegg <- kegga(vfit,coef=i, geneid=as.character(ens2entrez[rownames(vfit)]),FDR=0.05, species="Mm")
+      kegg <- tidy_bh_go(kegg)
+      gokegga[[paste0("kegga_",coeff)]] <- kegg
+    }
+    else{
+      kegg <- gokegga[[paste0("kegga_",coeff)]]
+    }
+    print("kegg")
+    print( table(kegg$QValue <= 0.05))
+  
+      
+    if( any( kegg$QValue <= 0.05) ){
+      #write.table(kegg,paste0(plotdir,keggname,".txt"),quote=FALSE,sep="\t",row.names=FALSE)
+        print( kegg[kegg$QValue <= 0.05,])
+    }
+    if( any( go$QValue <= 0.05) ){
+      #write.table(go,paste0(plotdir,goname,".txt"),quote=FALSE,sep="\t",row.names=FALSE)
+        print( go[go$QValue <= 0.05,])
+    }
+  }
+  return( gokegga )
+}
+
+gseaTotal <- getKeggsGos(vfit_eb_total, coeffs=c("design_total$descriptionRiboTag CD4 Teff IL7 rested O/N total RNA input","design_total$descriptionRiboTag CD4 Teff stimulated with Tregs total RNA input"))
+gseaRiboip <- getKeggsGos(vfit_eb_riboip, coeffs=c("design_riboip$descriptionRiboTag CD4 Teff IL7 rested O/N Ribo_IP","design_riboip$descriptionRiboTag CD4 Teff stimulated with Tregs Ribo_IP"))
+
+convertNames <- function(names){
+  gset <- ifelse( grepl("kegga", names), "KEGG","GO")
+  stim <- ifelse( grepl("IL7", names), "IL7.rested","Tregs")
+  return( paste( gset, stim, sep="."))
+}
+names(gseaTotal) <- convertNames( names(gseaTotal) )
+names(gseaRiboip) <- convertNames( names(gseaRiboip) )
+
+names(gseaTotal) <- paste0( "Total.", names(gseaTotal))
+names(gseaRiboip) <- paste0( "Riboip.", names(gseaTotal))
+gsea <- c(gseaTotal, gseaRiboip)
+for( nam in names(gsea) ){
+  write.table(gsea[[nam]], paste0("../../data/2021-11-03/",nam,".txt"),sep="\t",col.names=NA,quote=FALSE)
+}
+
+for( nam in names(comparisons)[1:4]){
+  fnam <- gsub(" ",".",gsub("\\.","",nam))
+  print(fnam)
+  write.table(comparisons[[nam]],paste0("../../data/2021-11-03/",fnam,"_DE.txt"),quote=FALSE,sep="\t",col.names=NA)
+}
+
+ens <- rownames(comparisons[[1]])
+for( i in c(1,3)){
+  df <- data.frame( riboip=comparisons[[i]][ens,"logFC"], riboipFDR=comparisons[[i]][ens,"adj.P.Val"],  total=comparisons[[i+1]][ens,"logFC"], totalFDR=comparisons[[i+1]][ens,"adj.P.Val"] )
+  nam <- gsub(" riboip","",names(comparisons)[i])
+  if( nam == "rest vs. stim" ){
+    nam <- "stim vs. rest"
+    df$riboip <- -1*df$riboip
+    df$total <- -1*df$total
+  }
+  df$anno <- rep("neither",nrow(df) )
+  df$anno[ df$totalFDR <= 0.05 ] <- "total RNA"
+  df$anno[ df$riboipFDR <= 0.05 ] <- "riboIP RNA"
+  df$anno[ df$totalFDR <= 0.05 & df$riboipFDR <= 0.05 ] <- "both"
+  df <- df[rev(order(df$anno == "neither")),]
+  fnam <- gsub(" ",".",gsub("\\.","",nam))
+  p <- ggplot(df, aes(x=total,y=riboip, color=anno)) + geom_point(shape=4) + labs(title=paste0("log fold-change in ",nam),x="total RNA",y="RiboIP", color="differential\nexpression\nFDR <= 0.05") + scale_color_manual( values=c("neither"="grey","both"="purple","total RNA"="red","riboIP RNA"="blue")) + xlim(c(-5,8.5)) + ylim( c(-5,8.5))
+  pdf( paste0("../../data/2021-11-03/",fnam,"_logFC_RiboIPvTotal.pdf"), width=7,height=5 )
+  print(p)
+  dev.off()
+}
+
+```
+
+
+```{r MAST for batch effect}
+library(MAST)
+
+makeDETable_contrast <- function( z, h, contrast ){
+  print("A")
+  print("B")
+  lrt0 <- lrTest(z ,h )
+  print("C")
+  detable <- data.frame( P.Value.D = lrt0[,"disc","Pr(>Chisq)"]  )
+  detable$adj.P.Val.D <- p.adjust(detable$P.Value.D,"fdr") #FDR for multiple testing
+
+  detable$P.Value.C <- lrt0[,"cont","Pr(>Chisq)"]  
+  detable$adj.P.Val.C <- p.adjust(detable$P.Value.C,"fdr") #FDR for multiple
+
+  detable$P.Value.H <- lrt0[,"hurdle","Pr(>Chisq)"]  
+  detable$adj.P.Val.H <- p.adjust(detable$P.Value.H,"fdr") #FDR for multiple
+    
+  #Get log2-fold changes
+  cd <- coef(z,"D") # continuous coefficients
+  detable$logOE<- cd[rownames(detable),] %*% contrast
+  cc <- coef(z,"C") # continuous coefficients
+  detable$logFC<- cc[rownames(detable),] %*% contrast
+  #Add hgnc names to the lfc results
+  detable$HGNC.symbol <- gene_key$HGNC.symbol[match(rownames(detable), gene_key$Ensembl.Gene.ID)]
+  detable$logPVal.D <- -log10( detable$adj.P.Val.D)
+  detable$logPVal.C <- -log10( detable$adj.P.Val.C)
+  detable$logPVal.C <- -log10( detable$adj.P.Val.H)
+
+  return(detable)
+}
+
+
+design_qc$sort_reformatted <- gsub("\\+","p",design_qc$sort)
+design_qc$sort_reformatted <- gsub("\\-","m",design_qc$sort_reformatted )
+
+#MAST takes log2 transformed counts as input
+libs <- colnames(counts_qc)
+ltcounts <- log2(as.data.frame( counts_pc_norm)+1)
+
+fData <- data.frame(primerid = rownames(ltcounts)) #primerid = gene name
+cData <- data.frame(wellKey = colnames(ltcounts), 
+                    cdr= design_qc[colnames(ltcounts),"cdr"],
+                    sort = design_qc[colnames(ltcounts),"sort_reformatted"] )
+matCounts <- as.matrix(ltcounts)
+sca <- FromMatrix(matCounts, cData, fData, 'SingleCellAssay') 
+
+plot(density(as.matrix(ltcounts)))
+#Manually pick a threshold that seems reasonable and check on plot
+fixed_threshold <- 2
+abline(v=fixed_threshold, col="red")
+
+#Set type of thresholding
+thres <- "fixed"
+if (thres == "adapt") {
+  exprs(sca) <- tt$counts_threshold
+} else if (thres == "fixed") {
+  mat <- exprs(sca)
+  mat[mat < fixed_threshold] <- 0
+  exprs(sca) <- mat
+}
+
+
+zlm_cdr_sort_nointercept <- zlm(~0+cdr+sort, sca, 
+                        method = "bayesglm", 
+                        hook=deviance_residuals_hook,
+                        ebayes = TRUE, 
+                        ebayesControl = list(method = "MLE", model = "H1"))
+
+
+
+
+coeffs <- colnames(coef(zlm_cdr_sort_nointercept,"D"))
+sorts <- coeffs[ grep("sort",coeffs)]
+comparisons<- list()
+# Make all 1 vs all comparisons
+for( i in 1:length(sorts) ){
+  s1 <- sorts[i]
+  print(s1)
+  nminus1 <- length(sorts)-1
+  minusstring <- paste( sorts[sorts!=s1], collapse="-")
+  hstring <- paste0(nminus1,"*(",s1,")-",minusstring)
+  h <- Hypothesis( hstring, terms=coeffs )
+  contrast0 <- rep(0,length(coeffs))
+  contrast0[ coeffs %in% sorts ] = -1
+  contrast0[coeffs==s1] = nminus1
+  print(contrast0)
+  print(hstring)
+  if( hstring %in% names(comparisons)){
+    w <- comparisons[[hstring]]
+  }
+  else{ 
+    #w <- makeDETable_contrast(zlm_cdr_sort_nointercept,h, contrast0) 
+    #comparisons[[hstring]] <- w
+  }
+  s1lab <- gsub("sort","",s1); 
+  s1lab <- gsub("p","+",s1lab); 
+  s1lab <- gsub("m","-",s1lab); 
+  
+  w <- w[order(w$P.Value.H),]
+  
+  print( table( w$adj.P.Val.H <= 0.05 ))
+  write.table(w,paste0(plotdir,s1lab  ,"_mast.txt"),sep="\t",col.names=NA,quote=FALSE)
+}
+
+```
+
+```{r riboip/input histograms outside of limma}
+
+tpm_pc_log <- log2( tpm_pc + 1)
+
+des <- des[ order(des$mouseid),]
+sets <- unique(des$description)
+liblist <- lapply( sets, function(s) rownames(des)[ des$description == s ] )
+names(liblist) <- sets
+
+riboip <- list()
+riboip[["IL7"]] <-  tpm_pc_log[,liblist[["RiboTag CD4 Teff IL7 rested O/N Ribo_IP"]]] - tpm_pc_log[,liblist[["RiboTag CD4 Teff IL7 rested O/N total RNA input"]]]
+riboip[["Stimulated"]] <-  tpm_pc_log[,liblist[["RiboTag CD4 Teff stimulated 36h Ribo_IP"]]] - tpm_pc_log[,liblist[["RiboTag CD4 Teff stimulated 36h total RNA input"]]]
+riboip[["Stimulated + Tregs"]] <- tpm_pc_log[,liblist[["RiboTag CD4 Teff stimulated with Tregs Ribo_IP"]]] - tpm_pc_log[,liblist[["RiboTag CD4 Teff stimulated with Tregs total RNA input"]]]
+
+dotests <- function( de ){
+  de <- data.frame( mean = rowMeans(de), p.value = apply( de, 1, function(r) t.test(r)$p.value))
+  de$FDR <- p.adjust( de$p.value, method="BH")
+  return(de)
+}
+riboiptests <- lapply( riboip, dotests)
+
+# Histograms for differences between polysomal and sub-polysomal
+comps <- names(riboiptests)
+for( comp in comps){
+  DE <- riboiptests[[comp]]
+  print(comp)
+  DE$FDR[ is.na(DE$FDR)] <- 1
+  DE$significant <- ifelse(DE$FDR <= 0.05, "FDR <= 0.05", "N.S.")
+  print(table(DE$significant))
+  numsig <- sum(DE$significant == "FDR <= 0.05")
+  DE$significant <- relevel( as.factor(DE$significant),"N.S.")
+  p <- ggplot(DE,aes(x=mean, color=significant)) + geom_histogram(binwidth=.1) + scale_color_manual(values=sigcols) + labs(y="gene count",x="log2 TPM\nRibo-IP / Input", color="", title=comp) + geom_vline(xintercept=0, linetype="dotted") + ylim(c(0,2200)) + xlim(c(-4,4))
+  png( paste0(plotdir, comp, "_tpm_hist_notLIMMA.png"), width=500,height=300 )
+  print(p)
+  dev.off()
+}
+
+
+```
+
+```{r ribo stim v rest try again but with more intuitive contrasts and names}
+library(reshape2)
+
+### DO ribo stim vs rest and also volcano plot for difference ribo / total.
+
+design$mouseid <- sapply( design$sample_name, function(s) strsplit(s,"_")[[1]][3])
+libids <- dcast(design[,c("libId","description","mouseid")], mouseid ~ description,  value.var="libId" )
+design$fraction <- ifelse( grepl( "input",design$description), "input","riboIP")
+design$stimulation <- ifelse( grepl( "Tregs" ,design$description), "Tregs","")
+
+#Extended Figure 3D.
+#1) 
+#X-axis should be: (Ctrl CD4 Teff stimulated total RNA input) - (CD4 Teff IL7 rested total RNA input)
+#Y-axis should be: (Ctrl CD4 Teff stimulated Ribo_IP) - (CD4 Teff IL7 rested Ribo_IP)
+#2) 
+#X-axis should be: (CD4 Teff stimulated with Tregs total RNA input) - (CD4 Teff stimulated total RNA input)
+#Y-axis should be: (CD4 Teff stimulated with Tregs Ribo_IP) - (CD4 Teff stimulated Ribo_IP)
+
+#So, the 
+#RiboTag CD4 Teff IL7 rested O/N samples
+#RiboTag CD4 Teff stimulated 36h (Samples #3-5)
+#RiboTag CD4 Teff stimulated with Tregs (Samples #3-5) 
+total_stim_rest_ratio <- log2( (counts_pc_norm[, libids$`RiboTag CD4 Teff stimulated 36h total RNA input`]+1) / (counts_pc_norm[, libids$`RiboTag CD4 Teff IL7 rested O/N total RNA input`]+1))
+riboip_stim_rest_ratio <- log2( (counts_pc_norm[, libids$`RiboTag CD4 Teff stimulated 36h Ribo_IP`]+1) / (counts_pc_norm[, libids$`RiboTag CD4 Teff IL7 rested O/N Ribo_IP`]+1))
+df <- data.frame( totalRNA = rowMeans( total_stim_rest_ratio), riboIP = rowMeans(riboip_stim_rest_ratio))
+ggplot( df, aes(x=totalRNA,y=riboIP)) + geom_point()
+
+### Use LIMMA to get the log fold changes
+riboiplibs <- design$libId[ design$description %in% c("RiboTag CD4 Teff stimulated 36h Ribo_IP","RiboTag CD4 Teff IL7 rested O/N Ribo_IP","RiboTag CD4 Teff stimulated with Tregs Ribo_IP")]
+totallibs <- design$libId[ design$description %in% c("RiboTag CD4 Teff stimulated 36h total RNA input","RiboTag CD4 Teff IL7 rested O/N total RNA input", "RiboTag CD4 Teff stimulated with Tregs total RNA input")]
+
+
+clean_colnames <- function( cnames ){
+  cnames <- gsub( "design_limma\\$Cell.Type","",cnames)
+  cnames <- gsub( "design_limma\\$Study.Group","",cnames)
+  cnames <- gsub( " ",".",cnames)
+  cnames <- gsub( "\\+","p",cnames)
+  cnames <- gsub( "\\-","n",cnames)
+  return(cnames)
+}
+
+# Riboip: Get LIMMA DE genes between stim and nonstim, 
+design_riboip <- design[ riboiplibs,]
+design_riboip$description <- relevel( as.factor(design_riboip$description), "RiboTag CD4 Teff stimulated 36h Ribo_IP") # the stimulated is the base factor
+design_mat_riboip <- model.matrix(~ design_riboip$description + design_riboip$mouseid  )
+vwts_riboip<- voomWithQualityWeights(counts_pc_norm[,riboiplibs], design= design_mat_riboip, plot=T, span=0.1)
+vfit_riboip <- lmFit(vwts_riboip, design = design_mat_riboip)
+vfit_eb_riboip <- eBayes(vfit_riboip)
+
+# TotalRNA: Get LIMMA DE genes between stim and nonstim
+design_total <- design[ totallibs,]
+design_total$description <- relevel( as.factor(design_total$description), "RiboTag CD4 Teff stimulated 36h total RNA input")
+design_mat_total <- model.matrix(~ design_total$description + design_total$mouseid  )
+vwts_total<- voomWithQualityWeights(counts_pc_norm[,totallibs], design= design_mat_total, plot=T, span=0.1)
+vfit_total <- lmFit(vwts_total, design = design_mat_total)
+vfit_eb_total <- eBayes(vfit_total)
+DEtotal <- topTable (vfit_eb_total, coef = 2, number=Inf, sort.by="P")
+
+comparisons <- list()
+comparisons[["rest vs. stim riboip"]] <- topTable (vfit_eb_riboip, coef = 2, number=Inf, sort.by="P")
+comparisons[["rest vs. stim total"]] <- topTable (vfit_eb_total, coef = 2, number=Inf, sort.by="P")
+comparisons[["treg vs. stim riboip"]] <- topTable (vfit_eb_riboip, coef = 3, number=Inf, sort.by="P")
+comparisons[["treg vs. stim total"]] <- topTable (vfit_eb_total, coef = 3, number=Inf, sort.by="P")
+
+
+```
